@@ -1,0 +1,30 @@
+# Ignore everything by default
+*
+
+# But include these specific files
+!Import Poly Markets.py
+!README.md
+!.gitignore
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
