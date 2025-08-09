@@ -5,7 +5,7 @@ Display live Polymarket odds for every open MLB or NFL game.
 Requires: pip install requests
 """
 
-import requests, time, datetime as dt
+import requests, time, datetime as dt, json
 
 BASE = "https://gamma-api.polymarket.com"
 REFRESH_SECONDS = 60
@@ -19,12 +19,19 @@ def live_sports_events() -> list[dict]:
     events = r.json()
     print(f"DEBUG: Found {len(events)} total events")
     
-    # Debug: show all sports events
+    # Filter to sports category
     sports_events = [e for e in events if "sports" in (e.get("category") or "").lower()]
     print(f"DEBUG: Found {len(sports_events)} sports events")
-    
-    # For now, return all sports events instead of just MLB/NFL
-    return sports_events
+
+    # Filter by sport keywords in title (e.g., mlb, nfl)
+    filtered = []
+    for event in sports_events:
+        title_lower = (event.get("title") or "").lower()
+        if any(keyword in title_lower for keyword in SPORT_KEYWORDS):
+            filtered.append(event)
+    print(f"DEBUG: Filtered to {len(filtered)} events matching {SPORT_KEYWORDS}")
+
+    return filtered
 
 
 def markets_for(event_id: str) -> list[dict]:
@@ -34,20 +41,71 @@ def markets_for(event_id: str) -> list[dict]:
     return r.json()
 
 
+def _parse_outcomes_and_prices(market: dict) -> list[tuple[str, float]]:
+    """Return list of (outcome_name, price_float_0_to_1) for a market.
+
+    The Gamma API often returns 'outcomes' and 'outcomePrices' as stringified JSON arrays.
+    This function handles both string and list forms.
+    """
+    outcomes_raw = market.get("outcomes")
+    prices_raw = market.get("outcomePrices")
+
+    # Parse outcomes
+    if isinstance(outcomes_raw, str):
+        try:
+            outcomes_list = json.loads(outcomes_raw)
+        except Exception:
+            outcomes_list = []
+    elif isinstance(outcomes_raw, list):
+        outcomes_list = outcomes_raw
+    else:
+        outcomes_list = []
+
+    # Parse prices
+    if isinstance(prices_raw, str):
+        try:
+            prices_list = json.loads(prices_raw)
+        except Exception:
+            prices_list = []
+    elif isinstance(prices_raw, list):
+        prices_list = prices_raw
+    else:
+        prices_list = []
+
+    # Normalize price strings to floats
+    normalized_prices: list[float] = []
+    for p in prices_list:
+        try:
+            normalized_prices.append(float(p))
+        except Exception:
+            normalized_prices.append(0.0)
+
+    # Pair outcomes with prices; if lengths mismatch, truncate to shortest
+    paired: list[tuple[str, float]] = []
+    for name, price in zip(outcomes_list, normalized_prices):
+        # Some APIs may include dict outcomes; keep only the name string
+        if isinstance(name, dict):
+            name = name.get("name") or "Unknown"
+        paired.append((str(name), float(price)))
+
+    return paired
+
+
 def print_board(events: list[dict]):
     """Pretty-print prices for every event/market/outcome."""
-    timestamp = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"\n==== {timestamp}  — Polymarket live odds ====\n")
 
     for ev in events:
         print(f"🏟️  {ev['title']}  (eventId {ev['id']})")
         for m in markets_for(ev["id"]):
-            if m.get("closed"):
+            # Only show active, open markets
+            if m.get("closed") or not m.get("active", True):
                 continue
             print(f" • {m['question']}")
-            for o in m.get("outcomes", []):
-                price_cents = o["price"] * 100
-                print(f"    └─ {o['name']:<20}: {price_cents:5.1f}¢")
+            for outcome_name, price in _parse_outcomes_and_prices(m):
+                price_cents = price * 100
+                print(f"    └─ {outcome_name:<20}: {price_cents:5.1f}¢")
         print()  # blank line between events
 
 
