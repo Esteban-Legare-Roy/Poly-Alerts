@@ -19,6 +19,11 @@ NFL_TEAM_ABBRS = [
     "ten","wsh"
 ]
 
+# Alert configuration via environment variables
+ALERT_DELTA_CENTS = float(os.getenv("ALERT_DELTA_CENTS", "2.0"))
+ALERT_ONLY_QUESTIONS = set(q.strip().lower() for q in (os.getenv("ALERT_ONLY_QUESTIONS", "").split("||")) if q.strip())
+ALERT_EVENT_SLUGS = set(s.strip() for s in (os.getenv("ALERT_EVENT_SLUGS", "").split(",")) if s.strip())
+
 
 def live_sports_events() -> list[dict]:
     """Return all active MLB & NFL events (games)."""
@@ -151,8 +156,13 @@ def print_board(events: list[dict]):
 def poll_nfl_events_for_date(target_date: dt.date, max_iterations: int | None = None):
     """Continuously poll NFL events for the given date and print odds when priced."""
     events = find_nfl_events_for_date(target_date)
+    if ALERT_EVENT_SLUGS:
+        events = [ev for ev in events if (ev.get("slug") or "") in ALERT_EVENT_SLUGS]
     event_ids = [str(ev["id"]) for ev in events]
     print(f"Polling {len(event_ids)} NFL events for {target_date} — {', '.join(event_ids)}")
+
+    # Memory of last seen prices per (eventId, marketId, outcomeName)
+    last_seen: dict[tuple[str, str, str], float] = {}
 
     iteration = 0
     while True:
@@ -170,19 +180,27 @@ def poll_nfl_events_for_date(target_date: dt.date, max_iterations: int | None = 
                 continue
 
             open_active = [m for m in mkts if not m.get("closed") and m.get("active", True)]
-            priced_pairs: list[tuple[str, list[tuple[str, float]]]] = []
+            priced_pairs: list[tuple[str, str, list[tuple[str, float]]]] = []
             for m in open_active:
+                question = m.get("question", f"market {m.get('id')}")
+                if ALERT_ONLY_QUESTIONS and question.lower() not in ALERT_ONLY_QUESTIONS:
+                    continue
                 pairs = _parse_outcomes_and_prices(m)
                 if pairs:
-                    priced_pairs.append((m.get("question", f"market {m.get('id')}") , pairs))
+                    priced_pairs.append((str(m.get("id")), question, pairs))
 
             if priced_pairs:
                 any_printed = True
                 print(f"🏟️  {ev.get('title')}  (eventId {ev_id})")
-                for question, pairs in priced_pairs:
+                for market_id, question, pairs in priced_pairs:
                     print(f" • {question}")
                     for outcome_name, price in pairs:
-                        print(f"    └─ {outcome_name:<20}: {price*100:5.1f}¢")
+                        key = (ev_id, market_id, outcome_name)
+                        price_cents = price * 100.0
+                        previous = last_seen.get(key)
+                        if previous is None or abs(price_cents - previous) >= ALERT_DELTA_CENTS:
+                            print(f"    └─ {outcome_name:<20}: {price_cents:5.1f}¢")
+                            last_seen[key] = price_cents
                 print()
             else:
                 print(f"(no priced open markets yet) {ev.get('title')}  (eventId {ev_id})")
