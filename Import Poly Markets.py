@@ -24,6 +24,11 @@ ALERT_DELTA_CENTS = float(os.getenv("ALERT_DELTA_CENTS", "2.0"))
 ALERT_ONLY_QUESTIONS = set(q.strip().lower() for q in (os.getenv("ALERT_ONLY_QUESTIONS", "").split("||")) if q.strip())
 ALERT_EVENT_SLUGS = set(s.strip() for s in (os.getenv("ALERT_EVENT_SLUGS", "").split(",")) if s.strip())
 
+# WebSocket configuration (optional)
+WSS_URL = os.getenv("WSS_URL", "")
+WSS_SUB_MSG = os.getenv("WSS_SUB_MSG", "")  # Python format str; supports {tokenIds_csv}, {tokenIds_json}
+WSS_PING_INTERVAL = float(os.getenv("WSS_PING_INTERVAL", "25"))
+
 
 def live_sports_events() -> list[dict]:
     """Return all active MLB & NFL events (games)."""
@@ -135,6 +140,54 @@ def _parse_outcomes_and_prices(market: dict) -> list[tuple[str, float]]:
     return paired
 
 
+def _parse_outcomes_list(raw: object) -> list[str]:
+    if isinstance(raw, str):
+        try:
+            return [str(x) for x in json.loads(raw)]
+        except Exception:
+            return []
+    if isinstance(raw, list):
+        return [str(x.get("name") if isinstance(x, dict) else x) for x in raw]
+    return []
+
+
+def _parse_token_ids(raw: object) -> list[str]:
+    if isinstance(raw, str):
+        try:
+            return [str(x) for x in json.loads(raw)]
+        except Exception:
+            return []
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    return []
+
+
+def collect_token_map_for_events(events: list[dict]) -> dict[str, dict]:
+    """Build mapping of tokenId -> metadata {eventId, marketId, question, outcomeIndex, outcomeName}."""
+    token_to_meta: dict[str, dict] = {}
+    for ev in events:
+        ev_id = str(ev.get("id"))
+        try:
+            for m in markets_for(ev_id):
+                market_id = str(m.get("id"))
+                question = m.get("question") or f"market {market_id}"
+                token_ids = _parse_token_ids(m.get("clobTokenIds"))
+                outcomes = _parse_outcomes_list(m.get("outcomes"))
+                for idx, token_id in enumerate(token_ids):
+                    outcome_name = outcomes[idx] if idx < len(outcomes) else f"Outcome {idx}"
+                    token_to_meta[token_id] = {
+                        "eventId": ev_id,
+                        "marketId": market_id,
+                        "question": question,
+                        "outcomeIndex": idx,
+                        "outcomeName": str(outcome_name),
+                        "eventTitle": ev.get("title") or f"event {ev_id}",
+                    }
+        except Exception:
+            continue
+    return token_to_meta
+
+
 def print_board(events: list[dict]):
     """Pretty-print prices for every event/market/outcome."""
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -210,10 +263,159 @@ def poll_nfl_events_for_date(target_date: dt.date, max_iterations: int | None = 
         time.sleep(REFRESH_SECONDS)
 
 
+def stream_prices_via_websocket(target_date: dt.date):
+    """Subscribe to tokenIds for NFL events on target_date via WebSocket and emit alerts on price updates.
+
+    Requires: websocket-client
+    Configure: WSS_URL, optional WSS_SUB_MSG (format string using {tokenIds_csv}, {tokenIds_json})
+    """
+    try:
+        import websocket  # type: ignore
+    except Exception as exc:
+        raise SystemExit("websocket-client is required. Install with: pip install websocket-client")
+
+    events = find_nfl_events_for_date(target_date)
+    if ALERT_EVENT_SLUGS:
+        events = [ev for ev in events if (ev.get("slug") or "") in ALERT_EVENT_SLUGS]
+    if not events:
+        print(f"No NFL events discovered for {target_date}")
+        return
+
+    token_map = collect_token_map_for_events(events)
+    token_ids = list(token_map.keys())
+    if not token_ids:
+        print("No tokenIds found for selected events. Cannot stream via WebSocket.")
+        return
+
+    token_ids_csv = ",".join(token_ids)
+    token_ids_json = json.dumps(token_ids)
+
+    if not WSS_URL:
+        raise SystemExit("Set WSS_URL to the Polymarket CLOB WebSocket endpoint to enable streaming.")
+
+    sub_payload = None
+    if WSS_SUB_MSG:
+        try:
+            sub_payload = WSS_SUB_MSG.format(tokenIds_csv=token_ids_csv, tokenIds_json=token_ids_json)
+        except Exception as exc:
+            raise SystemExit(f"Invalid WSS_SUB_MSG format: {exc}")
+
+    last_seen: dict[tuple[str, str, str], float] = {}
+
+    def on_open(ws):  # type: ignore
+        if sub_payload:
+            ws.send(sub_payload)
+        print(f"Subscribed to {len(token_ids)} tokens")
+
+    def on_message(ws, message):  # type: ignore
+        try:
+            data = json.loads(message)
+        except Exception:
+            return
+
+        # Normalize to a list of updates
+        updates = []
+        if isinstance(data, list):
+            updates = data
+        elif isinstance(data, dict):
+            # If wrapped
+            if "data" in data and isinstance(data["data"], list):
+                updates = data["data"]
+            else:
+                updates = [data]
+        else:
+            return
+
+        for upd in updates:
+            # Try to extract tokenId and a price
+            token_id = str(upd.get("tokenId") or upd.get("id") or upd.get("token_id") or "")
+            if not token_id or token_id not in token_map:
+                continue
+
+            price = None
+            # Direct fields
+            for key in ("lastPrice", "price", "mid", "markPrice"):
+                v = upd.get(key)
+                if isinstance(v, (int, float)):
+                    price = float(v)
+                    break
+                if isinstance(v, str):
+                    try:
+                        price = float(v)
+                        break
+                    except Exception:
+                        pass
+            # Compute from bestBid/bestAsk
+            if price is None:
+                bid = upd.get("bestBid")
+                ask = upd.get("bestAsk")
+                try:
+                    bid_f = float(bid) if bid is not None else None
+                    ask_f = float(ask) if ask is not None else None
+                    if bid_f is not None and ask_f is not None and ask_f >= 0 and bid_f >= 0:
+                        price = (bid_f + ask_f) / 2.0
+                except Exception:
+                    pass
+            # Compute from orderbook
+            if price is None:
+                bids = upd.get("bids") or []
+                asks = upd.get("asks") or []
+                try:
+                    best_bid = max(float(b[0]) for b in bids) if bids else None
+                    best_ask = min(float(a[0]) for a in asks) if asks else None
+                    if best_bid is not None and best_ask is not None:
+                        price = (best_bid + best_ask) / 2.0
+                    elif best_bid is not None:
+                        price = best_bid
+                    elif best_ask is not None:
+                        price = best_ask
+                except Exception:
+                    pass
+
+            if price is None:
+                continue
+
+            meta = token_map[token_id]
+            ev_id = meta["eventId"]
+            market_id = meta["marketId"]
+            outcome_name = meta["outcomeName"]
+            question = meta["question"]
+            event_title = meta["eventTitle"]
+
+            if ALERT_ONLY_QUESTIONS and question.lower() not in ALERT_ONLY_QUESTIONS:
+                continue
+
+            key = (ev_id, market_id, outcome_name)
+            price_cents = price * 100.0
+            previous = last_seen.get(key)
+            if previous is None or abs(price_cents - previous) >= ALERT_DELTA_CENTS:
+                ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                print(f"[{ts}] {event_title} — {question} — {outcome_name}: {price_cents:5.1f}¢")
+                last_seen[key] = price_cents
+
+    def on_error(ws, error):  # type: ignore
+        print("WS error:", error)
+
+    def on_close(ws, code, reason):  # type: ignore
+        print("WS closed:", code, reason)
+
+    websocket.enableTrace(False)
+    ws_app = websocket.WebSocketApp(
+        WSS_URL,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+    )
+
+    # Blocking run_forever with periodic ping
+    ws_app.run_forever(ping_interval=WSS_PING_INTERVAL, ping_timeout=10)
+
+
 if __name__ == "__main__":
     # Optional: single-run mode to list NFL games for a given date
     date_env = os.getenv("NFL_DATE")  # format YYYY-MM-DD
-    if date_env and os.getenv("NFL_POLL") != "1":
+    if date_env and os.getenv("NFL_POLL") != "1" and os.getenv("NFL_WS") != "1":
         try:
             target = dt.date.fromisoformat(date_env)
         except Exception:
@@ -233,6 +435,15 @@ if __name__ == "__main__":
         max_iters_env = os.getenv("NFL_MAX_ITERS")
         max_iters = int(max_iters_env) if (max_iters_env and max_iters_env.isdigit()) else None
         poll_nfl_events_for_date(target, max_iterations=max_iters)
+        raise SystemExit(0)
+
+    # Optional: WebSocket streaming mode for NFL date
+    if date_env and os.getenv("NFL_WS") == "1":
+        try:
+            target = dt.date.fromisoformat(date_env)
+        except Exception:
+            raise SystemExit(f"Invalid NFL_DATE: {date_env}")
+        stream_prices_via_websocket(target)
         raise SystemExit(0)
 
     while True:
