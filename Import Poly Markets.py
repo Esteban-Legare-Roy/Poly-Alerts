@@ -148,10 +148,54 @@ def print_board(events: list[dict]):
         print()  # blank line between events
 
 
+def poll_nfl_events_for_date(target_date: dt.date, max_iterations: int | None = None):
+    """Continuously poll NFL events for the given date and print odds when priced."""
+    events = find_nfl_events_for_date(target_date)
+    event_ids = [str(ev["id"]) for ev in events]
+    print(f"Polling {len(event_ids)} NFL events for {target_date} — {', '.join(event_ids)}")
+
+    iteration = 0
+    while True:
+        iteration += 1
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        print(f"\n==== {timestamp} — NFL odds for {target_date} (iteration {iteration}) ====\n")
+
+        any_printed = False
+        for ev in events:
+            ev_id = str(ev["id"])
+            try:
+                mkts = markets_for(ev_id)
+            except Exception as exc:
+                print(f"⚠️  Error fetching markets for event {ev_id}: {exc}")
+                continue
+
+            open_active = [m for m in mkts if not m.get("closed") and m.get("active", True)]
+            priced_pairs: list[tuple[str, list[tuple[str, float]]]] = []
+            for m in open_active:
+                pairs = _parse_outcomes_and_prices(m)
+                if pairs:
+                    priced_pairs.append((m.get("question", f"market {m.get('id')}") , pairs))
+
+            if priced_pairs:
+                any_printed = True
+                print(f"🏟️  {ev.get('title')}  (eventId {ev_id})")
+                for question, pairs in priced_pairs:
+                    print(f" • {question}")
+                    for outcome_name, price in pairs:
+                        print(f"    └─ {outcome_name:<20}: {price*100:5.1f}¢")
+                print()
+            else:
+                print(f"(no priced open markets yet) {ev.get('title')}  (eventId {ev_id})")
+
+        if max_iterations is not None and iteration >= max_iterations:
+            break
+        time.sleep(REFRESH_SECONDS)
+
+
 if __name__ == "__main__":
     # Optional: single-run mode to list NFL games for a given date
     date_env = os.getenv("NFL_DATE")  # format YYYY-MM-DD
-    if date_env:
+    if date_env and os.getenv("NFL_POLL") != "1":
         try:
             target = dt.date.fromisoformat(date_env)
         except Exception:
@@ -160,6 +204,17 @@ if __name__ == "__main__":
         print(f"Found {len(events)} NFL events for {date_env}")
         for ev in events:
             print(f" - {ev.get('id')}: {ev.get('title')}  (slug {ev.get('slug')})")
+        raise SystemExit(0)
+
+    # Optional: polling mode for NFL date
+    if date_env and os.getenv("NFL_POLL") == "1":
+        try:
+            target = dt.date.fromisoformat(date_env)
+        except Exception:
+            raise SystemExit(f"Invalid NFL_DATE: {date_env}")
+        max_iters_env = os.getenv("NFL_MAX_ITERS")
+        max_iters = int(max_iters_env) if (max_iters_env and max_iters_env.isdigit()) else None
+        poll_nfl_events_for_date(target, max_iterations=max_iters)
         raise SystemExit(0)
 
     while True:
